@@ -127,6 +127,41 @@ def _import_cffi_mime():
         raise RuntimeError(f"curl_cffi CurlMime 不可用: {e}")
 
 
+def _resolve_mail_info(cred: dict) -> str:
+    """从号池解析源邮箱 mail_info（4 段格式）。
+
+    已有 mail_info 则直接返回；否则按 cred email 查 outlook_accounts，
+    必要时回退到 extra.base_email。查不到返回空串，不阻断导出。
+    """
+    direct = str(cred.get("mail_info") or "").strip()
+    if direct:
+        return direct
+    # 尝试从 extra 里取上游注入的 mail_info
+    extra = cred.get("extra") if isinstance(cred.get("extra"), dict) else {}
+    if isinstance(extra, dict):
+        em = str(extra.get("mail_info") or "").strip()
+        if em:
+            return em
+    email = str(cred.get("email") or "").strip().lower()
+    if not email:
+        return ""
+    try:
+        from . import db as _db
+        acc = _db.get_account(email)
+        if acc and acc.get("email"):
+            # 4 段 outlook 格式
+            return f"{acc.get('email') or ''}----{acc.get('password') or ''}----{acc.get('client_id') or ''}----{acc.get('refresh_token') or ''}"
+        # alias 情况：extra 里可能存 base_email
+        base = str(extra.get("base_email") or extra.get("source_email") or "").strip().lower()
+        if base:
+            acc2 = _db.get_account(base)
+            if acc2 and acc2.get("email"):
+                return f"{acc2.get('email') or ''}----{acc2.get('password') or ''}----{acc2.get('client_id') or ''}----{acc2.get('refresh_token') or ''}"
+    except Exception:
+        pass
+    return ""
+
+
 # ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
 
 
@@ -276,7 +311,9 @@ def build_cpa_token_json(cred: dict) -> dict:
     """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
 
     严格对齐 any-auto-register/cpa_upload.py:generate_token_json：
-    8 个字段，UTC+8 时区。
+    8 个字段 + mail_info，UTC+8 时区。
+    mail_info 为源邮箱 4 段格式 email----password----client_id----refresh_token，
+    用于 CPA 侧回溯源邮箱。
     """
     access_token = str(cred.get("access_token") or "").strip()
     if not access_token:
@@ -299,7 +336,7 @@ def build_cpa_token_json(cred: dict) -> dict:
         expired_str = datetime.fromtimestamp(exp, tz=tz_cn).strftime("%Y-%m-%dT%H:%M:%S+08:00")
     last_refresh = datetime.now(tz=tz_cn).strftime("%Y-%m-%dT%H:%M:%S+08:00")
 
-    return {
+    token_json: dict = {
         "type": "codex",
         "email": email,
         "expired": expired_str,
@@ -309,6 +346,11 @@ def build_cpa_token_json(cred: dict) -> dict:
         "last_refresh": last_refresh,
         "refresh_token": refresh_token,
     }
+    # 源邮箱信息（若上层已注入 mail_info 则一并导出）
+    mail_info = str(cred.get("mail_info") or "").strip()
+    if mail_info:
+        token_json["mail_info"] = mail_info
+    return token_json
 
 
 # ──────────────────────── CPA：上传 ────────────────────────
@@ -330,6 +372,12 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     cffi = _import_cffi()
     CurlMime = _import_cffi_mime()
 
+    # 自动注入 mail_info（若 cred 未带）
+    if not str(cred.get("mail_info") or "").strip():
+        mi = _resolve_mail_info(cred)
+        if mi:
+            cred = {**cred, "mail_info": mi}
+
     token_data = build_cpa_token_json(cred)
     email = token_data.get("email") or "unknown"
     filename = f"{email}.json"
@@ -346,7 +394,8 @@ def export_to_cpa(cred: dict, cfg: dict, *,
         f"文件名={filename}  内容大小={len(file_content)}B  "
         f"含 access_token={'是' if token_data.get('access_token') else '否'}  "
         f"含 refresh_token={'是' if token_data.get('refresh_token') else '否'}  "
-        f"含 id_token={'是' if token_data.get('id_token') else '否'}",
+        f"含 id_token={'是' if token_data.get('id_token') else '否'}  "
+        f"含 mail_info={'是' if token_data.get('mail_info') else '否'}",
         "info",
     )
 
@@ -653,14 +702,14 @@ def test_sub2api(cfg: dict) -> dict:
 def run_exports(cred: dict, *,
                   cpa_cfg: Optional[dict] = None,
                   sub2api_cfg: Optional[dict] = None,
-                  log_fn: Optional[Callable[[str, str], None]] = None) -> dict:
+                  log_fn: Optional[Callable[[str, str], None]] = None,
+                  allow_without_refresh_token: bool = False) -> dict:
     """注册完成后的可选导出入口。
 
     步骤：
       1. 检查两个目标是否有任一启用，全部未启用直接返回
-      2. 用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
-         （主项目最终保存的 access_token 是 NextAuth 风格的，CPA/SUB2API 不接受）
-      3. 用刷新后的 cred 走 CPA / SUB2API 导出
+      2. 默认用 cred['refresh_token'] 刷新一次拿新的 Codex access_token / id_token
+      3. allow_without_refresh_token=True 时（强制导出），无 RT 也可用现有凭证导出
 
     返回：
         {"cpa": {...} 或 None, "sub2api": {...} 或 None, "any_attempted": bool}
@@ -674,29 +723,45 @@ def run_exports(cred: dict, *,
         return out
 
     # ─ 关键：先用 refresh_token 换 Codex 风格 access_token ─
-    try:
-        log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
-        fresh = refresh_codex_token(cred.get("refresh_token", ""))
-        cred = {
-            **cred,
-            "access_token":  fresh["access_token"],
-            "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
-            "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
-        }
-        log(
-            f"[exporter] ✅ Codex token 刷新成功 "
-            f"(access_token len={len(fresh['access_token'])} "
-            f"id_token len={len(fresh.get('id_token') or '')})",
-            "ok",
-        )
-    except Exception as e:
-        log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
+    if cred.get("refresh_token"):
+        try:
+            log("[exporter] 用 refresh_token 换新的 Codex access_token...", "info")
+            fresh = refresh_codex_token(cred.get("refresh_token", ""))
+            cred = {
+                **cred,
+                "access_token":  fresh["access_token"],
+                "refresh_token": fresh.get("refresh_token") or cred.get("refresh_token"),
+                "id_token":      fresh.get("id_token") or cred.get("id_token", ""),
+            }
+            log(
+                f"[exporter] ✅ Codex token 刷新成功 "
+                f"(access_token len={len(fresh['access_token'])} "
+                f"id_token len={len(fresh.get('id_token') or '')})",
+                "ok",
+            )
+        except Exception as e:
+            if allow_without_refresh_token:
+                log(f"[exporter] Codex token 刷新失败，改用现有凭证继续导出: {e}", "warn")
+            else:
+                log(f"[exporter] ❌ Codex token 刷新失败，无法导出: {e}", "error")
+                if cpa_on:
+                    out["any_attempted"] = True
+                    out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+                if sub2_on:
+                    out["any_attempted"] = True
+                    out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+                return out
+    elif allow_without_refresh_token:
+        log("[exporter] 未拿到 refresh_token，按强制导出使用现有 access_token 导出", "warn")
+    else:
+        err = "缺少 refresh_token，无法刷新 Codex access_token"
+        log(f"[exporter] ❌ {err}", "error")
         if cpa_on:
             out["any_attempted"] = True
-            out["cpa"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            out["cpa"] = {"ok": False, "error": err}
         if sub2_on:
             out["any_attempted"] = True
-            out["sub2api"] = {"ok": False, "error": f"Codex token 刷新失败: {e}"}
+            out["sub2api"] = {"ok": False, "error": err}
         return out
 
     if cpa_on:

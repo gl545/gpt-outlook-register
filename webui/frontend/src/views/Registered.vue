@@ -6,6 +6,7 @@ import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
+  bulkExportRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
@@ -254,6 +255,47 @@ async function downloadAndDelete() {
   }
 }
 
+// ──────────── 导出到面板（CPA/SUB2API） ────────────
+const panelExporting = ref(false)
+const panelExportForce = ref(false)
+const panelExportResult = ref('')
+
+async function doBulkExport(force) {
+  const emails = selected.value.map((r) => r.email)
+  if (!emails.length) { ElMessage.warning('请先勾选要导出的账号'); return }
+  const tip = force
+    ? `强制导出选中的 ${emails.length} 条？\n将跳过 RT 校验，用现有 access/session/refresh 推面板。`
+    : `按当前自动导出配置导出选中的 ${emails.length} 条凭证？\n（无 RT 的会跳过）`
+  try {
+    await ElMessageBox.confirm(tip, '确认导出', {
+      type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消',
+      customClass: 'confirm-multiline',
+    })
+  } catch { return }
+  panelExportForce.value = !!force
+  panelExporting.value = true
+  panelExportResult.value = `${force ? '强制' : ''}导出中...`
+  try {
+    const r = await bulkExportRegistered({ emails, force: !!force })
+    const failedText = r.failed ? `，失败 ${r.failed}` : ''
+    panelExportResult.value = `✅ 已导出 ${r.exported}${failedText}${force ? '（强制）' : ''}`
+    ElMessage.success(panelExportResult.value)
+    // 控制台打印详细日志
+    if (Array.isArray(r.logs)) {
+      for (const entry of r.logs.slice(-20)) {
+        // eslint-disable-next-line no-console
+        console.log(entry.message)
+      }
+    }
+  } catch (e) {
+    const msg = e.response?.data?.detail || e.message
+    panelExportResult.value = '❌ ' + msg
+    ElMessage.error('导出失败: ' + msg)
+  } finally {
+    panelExporting.value = false
+  }
+}
+
 // 凭证弹窗
 const credVisible = ref(false)
 const credEmail = ref('')
@@ -391,6 +433,9 @@ onActivated(() => load())
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-button :loading="panelExporting && !panelExportForce" :disabled="!selected.length" @click="doBulkExport(false)">📤 导出选中</el-button>
+        <el-button type="warning" :loading="panelExporting && panelExportForce" :disabled="!selected.length" @click="doBulkExport(true)">⚡ 强制导出</el-button>
+        <span v-if="panelExportResult" class="hint">{{ panelExportResult }}</span>
         <el-divider direction="vertical" />
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})

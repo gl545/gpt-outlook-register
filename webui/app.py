@@ -675,6 +675,8 @@ class SaveExportConfigReq(BaseModel):
     sub2api_api_key: Optional[str] = None   # '***' 不修改
     sub2api_group_ids: Optional[str] = None  # 逗号分隔，例 "2" 或 "1,2,3"
     sub2api_timeout: Optional[str] = None
+    # 并发
+    export_threads: Optional[str] = None     # 1-20，默认 3
 
 
 @app.get("/api/settings/export")
@@ -714,6 +716,174 @@ class ManualExportReq(BaseModel):
     email: str = Field(..., description="要导出的已注册账号邮箱")
     targets: list[str] = Field(default_factory=lambda: ["cpa", "sub2api"],
                                 description="选择导出目标：cpa / sub2api")
+
+
+class BulkExportRegisteredReq(BaseModel):
+    emails: list[str]
+    force: bool = False  # 强制导出：跳过 RT 门槛，有凭证就推
+
+
+def _normalize_emails(emails: list[str] | None) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in emails or []:
+        email = str(raw or "").strip().lower()
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        out.append(email)
+    return out
+
+
+def _with_registered_extra(cred: dict) -> dict:
+    extra = cred.get("extra") if isinstance(cred.get("extra"), dict) else {}
+    merged = dict(cred)
+    for key, value in extra.items():
+        merged.setdefault(key, value)
+    return merged
+
+
+@app.post("/api/registered/bulk_export")
+def api_bulk_export_registered(req: BulkExportRegisteredReq):
+    """批量导出到面板：正常导出需 RT，强制导出跳过 RT 校验（多线程并发）。"""
+    import threading as _threading
+    from concurrent.futures import ThreadPoolExecutor as _TPE, as_completed as _as_completed
+
+    from . import exporter
+
+    emails = _normalize_emails(req.emails)
+    if not emails:
+        raise HTTPException(400, "emails cannot be empty")
+
+    cfg = db.get_export_internal_config()
+    cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
+    sub2api_enabled = bool(cfg.get("sub2api", {}).get("enabled"))
+    if not (cpa_enabled or sub2api_enabled):
+        raise HTTPException(400, "auto export has no enabled target")
+
+    # 并发数来自自动导出配置，默认 3，限制 1-20
+    try:
+        export_threads = int(cfg.get("export_threads") or 3)
+    except Exception:
+        export_threads = 3
+    export_threads = max(1, min(20, export_threads))
+    # 单条时无需线程池，避免额外开销
+    if len(emails) == 1:
+        export_threads = 1
+
+    force = bool(req.force)
+    tag = "bulk_export-force" if force else "bulk_export"
+
+    logs: list[dict] = []
+    _logs_lock = _threading.Lock()
+
+    def _log(msg: str, level: str = "info") -> None:
+        line = str(msg or "").strip()
+        if not line:
+            return
+        line = f"[{tag}] {line}"
+        with _logs_lock:
+            logs.append({"message": line, "level": level or "info"})
+        if level == "error":
+            logger.error(line)
+        elif level in ("warn", "warning"):
+            logger.warning(line)
+        else:
+            logger.info(line)
+
+    _log(
+        f"开始{'强制' if force else ''}导出 {len(emails)} 个账号 "
+        f"(cpa={cpa_enabled} sub2api={sub2api_enabled} threads={export_threads})",
+        "info",
+    )
+
+    # 单个邮箱的导出任务（线程安全：仅通过 _log 写共享 logs）
+    def _do_one(email: str) -> dict:
+        cred = db.get_registered(email)
+        if not cred:
+            _log(f"{email} 跳过: 注册结果不存在", "error")
+            return {"email": email, "ok": False, "error": "not found"}
+        cred = _with_registered_extra(cred)
+        if not force and not cred.get("refresh_token"):
+            err = "missing refresh_token"
+            _log(f"{email} 跳过: {err}", "warn")
+            return {"email": email, "ok": False, "error": err}
+        if force and not (
+            cred.get("refresh_token")
+            or cred.get("access_token")
+            or cred.get("session_token")
+        ):
+            err = "force export needs at least access_token / session_token / refresh_token"
+            _log(f"{email} 跳过: {err}", "error")
+            return {"email": email, "ok": False, "error": err}
+
+        _log(
+            f"{email} 开始导出 "
+            f"(force={force} has_rt={bool(cred.get('refresh_token'))})",
+            "info",
+        )
+        try:
+            results = exporter.run_exports(
+                cred,
+                cpa_cfg=cfg.get("cpa") if cpa_enabled else None,
+                sub2api_cfg=cfg.get("sub2api") if sub2api_enabled else None,
+                log_fn=_log,
+                allow_without_refresh_token=force,
+            )
+            target_results = {
+                k: v for k, v in (
+                    ("cpa", results.get("cpa")),
+                    ("sub2api", results.get("sub2api")),
+                )
+                if v is not None
+            }
+            item_ok = bool(target_results) and all(bool(v.get("ok")) for v in target_results.values())
+            if item_ok:
+                _log(f"{email} ✅ 导出成功", "ok")
+            else:
+                detail = {
+                    k: (v.get("error") or v.get("message") or ("ok" if v.get("ok") else "fail"))
+                    for k, v in target_results.items()
+                }
+                _log(f"{email} ❌ 导出失败: {detail}", "error")
+            return {
+                "email": email,
+                "ok": item_ok,
+                "results": target_results,
+                "allow_without_refresh_token": force,
+            }
+        except Exception as e:
+            _log(f"{email} ❌ 导出异常: {e}", "error")
+            return {"email": email, "ok": False, "error": str(e)}
+
+    items: list[dict] = []
+    if export_threads == 1 or len(emails) <= 1:
+        for em in emails:
+            items.append(_do_one(em))
+    else:
+        with _TPE(max_workers=export_threads) as _pool:
+            fut_map = { _pool.submit(_do_one, em): em for em in emails }
+            # 按完成顺序收集，再按输入顺序重排，保证前端展示稳定
+            tmp: dict[str, dict] = {}
+            for fut in _as_completed(fut_map):
+                em = fut_map[fut]
+                try:
+                    tmp[em] = fut.result()
+                except Exception as e:
+                    tmp[em] = {"email": em, "ok": False, "error": str(e)}
+            items = [tmp[em] for em in emails]
+
+    exported = sum(1 for it in items if it.get("ok"))
+    failed = len(items) - exported
+    _log(f"结束：成功 {exported} / 失败 {failed} / 共 {len(items)}", "info" if failed == 0 else "warn")
+    return {
+        "ok": True,
+        "exported": exported,
+        "failed": failed,
+        "items": items,
+        "logs": logs,
+        "force": force,
+    }
 
 
 @app.post("/api/registered/export_to_panel")

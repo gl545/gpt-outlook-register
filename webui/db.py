@@ -1145,6 +1145,8 @@ def get_export_config() -> dict:
         "sub2api_api_key":    "***" if get_setting("export_sub2api_api_key") else "",
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        # 并发
+        "export_threads":     get_setting("export_threads", "3"),
     }
 
 
@@ -1172,6 +1174,14 @@ def save_export_config(data: dict) -> None:
     ):
         if key_in in data:
             set_setting(key_out, str(data[key_in] or "").strip())
+    # 并发线程数
+    if "export_threads" in data:
+        try:
+            v = int(str(data["export_threads"]).strip())
+            v = max(1, min(20, v))
+            set_setting("export_threads", str(v))
+        except Exception:
+            pass
     # 密文字段（'***' 不修改）
     if data.get("cpa_mgmt_key") and data["cpa_mgmt_key"] != "***":
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
@@ -1197,7 +1207,12 @@ def get_export_internal_config() -> dict:
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
     }
-    return {"cpa": cpa, "sub2api": sub2api}
+    try:
+        threads = int(get_setting("export_threads", "3") or "3")
+    except Exception:
+        threads = 3
+    threads = max(1, min(20, threads))
+    return {"cpa": cpa, "sub2api": sub2api, "export_threads": threads}
 
 
 # 模块加载时自动建表

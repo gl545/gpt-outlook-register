@@ -69,6 +69,9 @@ openai-sentinel-demo/
 outputs/
 auth_trace_*.jsonl
 
+# ──────────────── 前端构建产物（vite build 生成，部署时本地构建）────────────────
+webui/static/
+
 # ──────────────── 配置覆盖（用户本地配置不进 repo）────────────────
 config.local.json
 .env

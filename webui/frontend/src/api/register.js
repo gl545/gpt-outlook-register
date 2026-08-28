@@ -37,6 +37,9 @@ export const checkPlus = (emails, proxy = '') =>
 export const exportToPanel = (email, targets) =>
   http.post('/api/registered/export_to_panel', { email, targets })
 
+export const bulkExportRegistered = (payload) =>
+  http.post('/api/registered/bulk_export', payload) // { emails, force }
+
 // ──────────────── 自动跑号 auto-loop ────────────────
 export const autoStart = (payload) => http.post('/api/auto/start', payload)
 export const autoPause = () => http.post('/api/auto/pause')
