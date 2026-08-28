@@ -162,6 +162,51 @@ def _resolve_mail_info(cred: dict) -> str:
     return ""
 
 
+def _resolve_two_fa_info(cred: dict) -> str:
+    """组装 2FA 导出格式 email----password----2FA----relay_url。
+
+    字段来源：email 取 cred.email，password 取 cred.password（注册结果里已保存的 OpenAI 密码），
+    2FA 取 cred.totp_secret，relay_url 取号池的 relay_url（icloud 类中转链接）。
+    已有 two_fa_info 直接返回；查不到则按分隔符保留空段（不跳行）。
+    """
+    direct = str(cred.get("two_fa_info") or "").strip()
+    if direct:
+        return direct
+    extra = cred.get("extra") if isinstance(cred.get("extra"), dict) else {}
+    if isinstance(extra, dict):
+        em = str(extra.get("two_fa_info") or "").strip()
+        if em:
+            return em
+    email = str(cred.get("email") or "").strip()
+    if not email:
+        return ""
+    password = str(cred.get("password") or "").strip()
+    totp = str(cred.get("totp_secret") or "").strip()
+    # extra 里也可能有 totp
+    if not totp and isinstance(extra, dict):
+        totp = str(extra.get("totp_secret") or "").strip()
+    relay = ""
+    try:
+        from . import db as _db
+        acc = _db.get_account(email.lower())
+        if acc:
+            relay = str(acc.get("relay_url") or "").strip()
+            # alias 回退
+            if not relay and isinstance(extra, dict):
+                base = str(extra.get("base_email") or extra.get("source_email") or "").strip().lower()
+                if base:
+                    acc2 = _db.get_account(base)
+                    if acc2:
+                        relay = str(acc2.get("relay_url") or "").strip()
+        # 若 password 在号池也有，优先用 registered 的（OpenAI 密码），号池的仅作回退
+        if not password and acc:
+            password = str(acc.get("password") or "").strip()
+    except Exception:
+        pass
+    # 即使部分为空也按 4 段输出，分隔符保留
+    return f"{email}----{password}----{totp}----{relay}"
+
+
 # ──────────────────────── 核心：刷新 Codex access_token ────────────────────────
 
 
@@ -311,9 +356,9 @@ def build_cpa_token_json(cred: dict) -> dict:
     """生成 CPA `/v0/management/auth-files` 的 multipart 文件内容。
 
     严格对齐 any-auto-register/cpa_upload.py:generate_token_json：
-    8 个字段 + mail_info，UTC+8 时区。
+    8 个字段 + mail_info + two_fa_info，UTC+8 时区。
     mail_info 为源邮箱 4 段格式 email----password----client_id----refresh_token，
-    用于 CPA 侧回溯源邮箱。
+    two_fa_info 为 email----password----2FA----relay_url，用于 CPA 侧回溯。
     """
     access_token = str(cred.get("access_token") or "").strip()
     if not access_token:
@@ -346,10 +391,13 @@ def build_cpa_token_json(cred: dict) -> dict:
         "last_refresh": last_refresh,
         "refresh_token": refresh_token,
     }
-    # 源邮箱信息（若上层已注入 mail_info 则一并导出）
+    # 源邮箱信息（若上层已注入则一并导出）
     mail_info = str(cred.get("mail_info") or "").strip()
     if mail_info:
         token_json["mail_info"] = mail_info
+    two_fa_info = str(cred.get("two_fa_info") or "").strip()
+    if two_fa_info:
+        token_json["two_fa_info"] = two_fa_info
     return token_json
 
 
@@ -372,11 +420,16 @@ def export_to_cpa(cred: dict, cfg: dict, *,
     cffi = _import_cffi()
     CurlMime = _import_cffi_mime()
 
-    # 自动注入 mail_info（若 cred 未带）
+    # 自动注入 mail_info / two_fa_info（若 cred 未带）
     if not str(cred.get("mail_info") or "").strip():
         mi = _resolve_mail_info(cred)
         if mi:
             cred = {**cred, "mail_info": mi}
+    if not str(cred.get("two_fa_info") or "").strip():
+        tfi = _resolve_two_fa_info(cred)
+        if tfi:
+            # 保留分隔符：即使 totp/relay 为空也按 4 段输出，避免 CPA 侧解析错位
+            cred = {**cred, "two_fa_info": tfi}
 
     token_data = build_cpa_token_json(cred)
     email = token_data.get("email") or "unknown"
@@ -395,7 +448,8 @@ def export_to_cpa(cred: dict, cfg: dict, *,
         f"含 access_token={'是' if token_data.get('access_token') else '否'}  "
         f"含 refresh_token={'是' if token_data.get('refresh_token') else '否'}  "
         f"含 id_token={'是' if token_data.get('id_token') else '否'}  "
-        f"含 mail_info={'是' if token_data.get('mail_info') else '否'}",
+        f"含 mail_info={'是' if token_data.get('mail_info') else '否'}  "
+        f"含 two_fa_info={'是' if token_data.get('two_fa_info') else '否'}",
         "info",
     )
 
