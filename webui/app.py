@@ -355,6 +355,23 @@ def api_runs(limit: int = 50):
     return {"ok": True, "items": db.list_runs(limit=limit)}
 
 
+class BulkDeleteRunsReq(BaseModel):
+    run_ids: Optional[list[str]] = Field(None, description="按 run_id 列表删")
+    all: bool = False  # true 则清空全部
+
+
+@app.post("/api/runs/bulk_delete")
+def api_bulk_delete_runs(req: BulkDeleteRunsReq):
+    """批量删除运行记录（释放内存/DB/日志文件）。"""
+    if req.all:
+        n = db.delete_all_runs()
+        return {"ok": True, "deleted": n, "by": "all"}
+    if req.run_ids:
+        n = db.delete_runs_by_ids(req.run_ids)
+        return {"ok": True, "deleted": n, "by": "ids"}
+    raise HTTPException(400, "需要 run_ids 或 all=true")
+
+
 @app.get("/api/registered")
 def api_registered(limit: int = 20, offset: int = 0, filter: str = "all"):
     items = db.list_registered(limit=limit, offset=offset, filter_rt=filter)
@@ -719,8 +736,10 @@ class ManualExportReq(BaseModel):
 
 
 class BulkExportRegisteredReq(BaseModel):
-    emails: list[str]
+    emails: Optional[list[str]] = None
     force: bool = False  # 强制导出：跳过 RT 门槛，有凭证就推
+    all: bool = False  # 跨页全选：导出全部（按 filter）
+    filter: str = "all"  # all 时生效，按注册结果筛选器过滤
 
 
 def _normalize_emails(emails: list[str] | None) -> list[str]:
@@ -751,9 +770,25 @@ def api_bulk_export_registered(req: BulkExportRegisteredReq):
 
     from . import exporter
 
-    emails = _normalize_emails(req.emails)
-    if not emails:
-        raise HTTPException(400, "emails cannot be empty")
+    # 跨页全选：all=true 时按 filter 导出全部，无需 emails
+    if req.all:
+        filt = (req.filter or "all").strip() or "all"
+        # 复用列表接口的过滤逻辑，取全量（100k 上限，足够覆盖常规号量）
+        try:
+            if filt == "all":
+                rows = db.list_registered_full(limit=100000)
+                emails = _normalize_emails([r.get("email") for r in rows])
+            else:
+                rows = db.list_registered(limit=100000, offset=0, filter_rt=filt)
+                emails = _normalize_emails([r.get("email") for r in rows])
+        except Exception as e:
+            raise HTTPException(500, f"获取全量列表失败: {e}")
+        if not emails:
+            raise HTTPException(400, "no registered accounts to export")
+    else:
+        emails = _normalize_emails(req.emails)
+        if not emails:
+            raise HTTPException(400, "emails cannot be empty")
 
     cfg = db.get_export_internal_config()
     cpa_enabled = bool(cfg.get("cpa", {}).get("enabled"))
