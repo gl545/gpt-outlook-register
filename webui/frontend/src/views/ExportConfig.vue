@@ -6,6 +6,7 @@ import FooterToolbar from '@/components/FooterToolbar.vue'
 
 const cpa = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴 CPA 管理密钥', timeout: 30 })
 const sub = reactive({ enabled: false, url: '', key: '', keyPh: '粘贴面板里生成的 x-api-key', groupIds: '2', timeout: 30 })
+const threads = ref(3)
 const saving = ref(false)
 const testingCpa = ref(false)
 const testingSub = ref(false)
@@ -24,6 +25,7 @@ async function load() {
     sub.keyPh = config.sub2api_api_key === '***' ? '已设置（留空不修改）' : '粘贴面板里生成的 x-api-key'
     sub.groupIds = config.sub2api_group_ids || '2'
     sub.timeout = Number(config.sub2api_timeout || 30)
+    threads.value = Number(config.export_threads || 3) || 3
   } catch (e) { ElMessage.error(e.message) }
 }
 
@@ -40,6 +42,7 @@ async function save() {
       sub2api_api_key: sub.key.trim() || '***',
       sub2api_group_ids: sub.groupIds.trim() || '2',
       sub2api_timeout: String(sub.timeout || 30),
+      export_threads: String(threads.value || 3),
     })
     ElMessage.success('保存成功')
     load()
@@ -103,6 +106,11 @@ onActivated(() => load())
           <el-input-number v-model="sub.timeout" :min="5" :max="300" />
         </el-form-item>
         <el-button :loading="testingSub" @click="test('sub2api')">测试 SUB2API 连通性</el-button>
+
+        <el-divider content-position="left">批量导出并发</el-divider>
+        <el-form-item label="导出线程数（批量导出到面板时的并发数，1-20，默认 3）">
+          <el-input-number v-model="threads" :min="1" :max="20" />
+        </el-form-item>
 
       </el-form>
     </el-card>

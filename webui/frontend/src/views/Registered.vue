@@ -1,11 +1,12 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, nextTick, onActivated, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
   listRegistered, getRegistered, deleteRegistered,
   bulkDeleteRegistered, bulkDeleteAccounts, checkPlus,
   listExportFormats, exportRegistered, updateCredentials,
+  bulkExportRegistered,
 } from '@/api/register'
 import { copyText, fmtTime } from '@/api/request'
 import { useFormStore, proxyText } from '@/stores/form'
@@ -29,6 +30,9 @@ const total = ref(0)
 const page = ref(1)
 const filter = ref('all')
 const selected = ref([])
+const isAllSelected = ref(false)
+const tableRef = ref(null)
+const isSyncingSelection = ref(false)
 const loading = ref(false)
 const checking = ref(false)
 const checkResult = ref('')
@@ -44,7 +48,10 @@ const PLUS_TYPE = {
 function plusOf(row) { return row.plus_check || null }
 
 async function load(resetPage) {
-  if (resetPage) page.value = 1
+  if (resetPage) {
+    page.value = 1
+    isAllSelected.value = false
+  }
   loading.value = true
   try {
     const { items, total: t } = await listRegistered({
@@ -52,8 +59,52 @@ async function load(resetPage) {
     })
     rows.value = items
     total.value = t
+    // 跨页全选时，自动勾选当前页所有行（需屏蔽期间的 selection-change 误判）
+    if (isAllSelected.value) {
+      isSyncingSelection.value = true
+      await nextTick()
+      tableRef.value?.toggleAllSelection()
+      await nextTick()
+      isSyncingSelection.value = false
+    }
   } catch (e) { ElMessage.error(e.message) }
   finally { loading.value = false }
+}
+
+function onSelectionChange(v) {
+  if (isSyncingSelection.value) {
+    selected.value = v
+    return
+  }
+  selected.value = v
+  // 全选状态下手动取消任一行，视为退出全选（避免“显示全选但导出仍全量”的歧义）
+  // loading 期间的清空（翻页时 rows 切换导致）不视为手动取消
+  if (isAllSelected.value && !loading.value && v.length !== rows.value.length) {
+    isAllSelected.value = false
+  }
+}
+
+function toggleAllSelected() {
+  if (isAllSelected.value) {
+    isAllSelected.value = false
+    selected.value = []
+    isSyncingSelection.value = true
+    nextTick(() => {
+      tableRef.value?.clearSelection()
+      nextTick(() => { isSyncingSelection.value = false })
+    })
+    ElMessage.info('已取消全选')
+    return
+  }
+  if (!total.value) { ElMessage.warning('当前筛选下无数据'); return }
+  isAllSelected.value = true
+  // 同步勾选当前页所有行
+  isSyncingSelection.value = true
+  nextTick(() => {
+    tableRef.value?.toggleAllSelection()
+    nextTick(() => { isSyncingSelection.value = false })
+  })
+  ElMessage.success(`已全选全部 ${total.value} 条（跨页，含筛选 ${filter.value}）`)
 }
 
 function collectEmails(mode) {
@@ -254,6 +305,58 @@ async function downloadAndDelete() {
   }
 }
 
+// ──────────── 导出到面板（CPA/SUB2API） ────────────
+const panelExporting = ref(false)
+const panelExportForce = ref(false)
+const panelExportResult = ref('')
+
+async function doBulkExport(force) {
+  const useAll = isAllSelected.value
+  let payload
+  let count = 0
+  if (useAll) {
+    if (!total.value) { ElMessage.warning('当前筛选下无数据'); return }
+    count = total.value
+    payload = { all: true, filter: filter.value, force: !!force }
+  } else {
+    const emails = selected.value.map((r) => r.email)
+    if (!emails.length) { ElMessage.warning('请先勾选要导出的账号，或使用“全选全部”'); return }
+    count = emails.length
+    payload = { emails, force: !!force }
+  }
+  const tip = force
+    ? `强制导出${useAll ? '全部' : '选中'}的 ${count} 条？\n将跳过 RT 校验，用现有 access/session/refresh 推面板。`
+    : `按当前自动导出配置导出${useAll ? '全部' : '选中'}的 ${count} 条凭证？\n（无 RT 的会跳过）`
+  try {
+    await ElMessageBox.confirm(tip, '确认导出', {
+      type: 'warning', confirmButtonText: '确定', cancelButtonText: '取消',
+      customClass: 'confirm-multiline',
+    })
+  } catch { return }
+  panelExportForce.value = !!force
+  panelExporting.value = true
+  panelExportResult.value = `${force ? '强制' : ''}导出中...`
+  try {
+    const r = await bulkExportRegistered(payload)
+    const failedText = r.failed ? `，失败 ${r.failed}` : ''
+    panelExportResult.value = `✅ 已导出 ${r.exported}${failedText}${force ? '（强制）' : ''}`
+    ElMessage.success(panelExportResult.value)
+    // 控制台打印详细日志
+    if (Array.isArray(r.logs)) {
+      for (const entry of r.logs.slice(-20)) {
+        // eslint-disable-next-line no-console
+        console.log(entry.message)
+      }
+    }
+  } catch (e) {
+    const msg = e.response?.data?.detail || e.message
+    panelExportResult.value = '❌ ' + msg
+    ElMessage.error('导出失败: ' + msg)
+  } finally {
+    panelExporting.value = false
+  }
+}
+
 // 凭证弹窗
 const credVisible = ref(false)
 const credEmail = ref('')
@@ -391,6 +494,13 @@ onActivated(() => load())
             </el-dropdown-menu>
           </template>
         </el-dropdown>
+        <el-button :type="isAllSelected ? 'primary' : 'default'" :disabled="!total" @click="toggleAllSelected">{{ isAllSelected ? '☑️ 取消全选' : `☐ 全选全部 (${total})` }}</el-button>
+        <template v-if="selected.length || isAllSelected">
+          <el-button :loading="panelExporting && !panelExportForce" @click="doBulkExport(false)">📤 {{ isAllSelected ? `导出全部 (${total})` : `导出选中 (${selected.length})` }}</el-button>
+          <el-button type="warning" :loading="panelExporting && panelExportForce" @click="doBulkExport(true)">⚡ {{ isAllSelected ? `强制导出全部 (${total})` : `强制导出 (${selected.length})` }}</el-button>
+        </template>
+        <span v-if="panelExportResult" class="hint">{{ panelExportResult }}</span>
+        <span v-if="isAllSelected" class="hint" style="color: var(--el-color-primary)">已全选 {{ total }} 条（跨页{{ filter !== 'all' ? `·${filter}` : '' }}）</span>
         <el-divider direction="vertical" />
         <el-button type="danger" plain :disabled="!selected.length" @click="deleteSelected">
           删除选中 ({{ selected.length }})
@@ -401,9 +511,10 @@ onActivated(() => load())
 
       <el-skeleton v-if="loading && !rows.length" :rows="6" animated style="padding: 8px 0" />
       <el-table
+        ref="tableRef"
         v-else
         v-loading="loading" :data="rows" size="small" stripe
-        @selection-change="(v) => (selected = v)"
+        @selection-change="onSelectionChange"
       >
         <el-table-column type="selection" width="44" />
         <el-table-column prop="email" label="邮箱" min-width="200" show-overflow-tooltip />

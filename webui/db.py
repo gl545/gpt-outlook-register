@@ -936,6 +936,64 @@ def list_runs(limit: int = 50) -> list[dict]:
     return [dict(r) for r in cur.fetchall()]
 
 
+def delete_runs_by_ids(run_ids: list[str]) -> int:
+    """按 run_id 列表批量删除运行记录，并清理对应日志文件。"""
+    cleaned = [str(r or "").strip() for r in (run_ids or []) if str(r or "").strip()]
+    if not cleaned:
+        return 0
+    with _lock:
+        con = _conn()
+        placeholders = ",".join("?" * len(cleaned))
+        # 先取日志路径，删库后清文件
+        try:
+            cur = con.execute(f"SELECT log_path FROM runs WHERE run_id IN ({placeholders})", cleaned)
+            paths = [row["log_path"] for row in cur.fetchall() if row["log_path"]]
+        except Exception:
+            paths = []
+        rc = con.execute(f"DELETE FROM runs WHERE run_id IN ({placeholders})", cleaned)
+        con.commit()
+        for p in paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        return rc.rowcount
+
+
+def delete_all_runs() -> int:
+    """清空全部运行记录，并清理日志目录。"""
+    with _lock:
+        con = _conn()
+        try:
+            cur = con.execute("SELECT log_path FROM runs")
+            paths = [row["log_path"] for row in cur.fetchall() if row["log_path"]]
+        except Exception:
+            paths = []
+        rc = con.execute("DELETE FROM runs")
+        con.commit()
+        for p in paths:
+            try:
+                Path(p).unlink(missing_ok=True)
+            except Exception:
+                pass
+        # 兜底清理残留日志文件（run 已删但文件仍在的孤儿）
+        try:
+            log_dir = Path(__file__).resolve().parent / "logs"
+            if log_dir.is_dir():
+                for f in log_dir.glob("*.log"):
+                    # 仅删超过 1 天的孤儿，避免误删正在写的
+                    try:
+                        if f.stat().st_mtime < time.time() - 86400:
+                            # 二次确认：库里已无对应 run_id
+                            if not con.execute("SELECT 1 FROM runs WHERE log_path=?", (str(f),)).fetchone():
+                                f.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return rc.rowcount
+
+
 # ──────────────────────── settings (KV) ────────────────────────
 
 
@@ -1145,6 +1203,8 @@ def get_export_config() -> dict:
         "sub2api_api_key":    "***" if get_setting("export_sub2api_api_key") else "",
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
+        # 并发
+        "export_threads":     get_setting("export_threads", "3"),
     }
 
 
@@ -1172,6 +1232,14 @@ def save_export_config(data: dict) -> None:
     ):
         if key_in in data:
             set_setting(key_out, str(data[key_in] or "").strip())
+    # 并发线程数
+    if "export_threads" in data:
+        try:
+            v = int(str(data["export_threads"]).strip())
+            v = max(1, min(20, v))
+            set_setting("export_threads", str(v))
+        except Exception:
+            pass
     # 密文字段（'***' 不修改）
     if data.get("cpa_mgmt_key") and data["cpa_mgmt_key"] != "***":
         set_setting("export_cpa_mgmt_key", str(data["cpa_mgmt_key"]).strip())
@@ -1197,7 +1265,12 @@ def get_export_internal_config() -> dict:
         "sub2api_group_ids":  get_setting("export_sub2api_group_ids", "2"),
         "sub2api_timeout":    get_setting("export_sub2api_timeout", "30"),
     }
-    return {"cpa": cpa, "sub2api": sub2api}
+    try:
+        threads = int(get_setting("export_threads", "3") or "3")
+    except Exception:
+        threads = 3
+    threads = max(1, min(20, threads))
+    return {"cpa": cpa, "sub2api": sub2api, "export_threads": threads}
 
 
 # 模块加载时自动建表
