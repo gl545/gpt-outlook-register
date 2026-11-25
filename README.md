@@ -123,6 +123,15 @@ WebUI 提供：
 python register_outlook.py 'email----password----client_id----refresh_token'
 ```
 
+## 代理池
+| 推荐代理服务 | 简介说明 |
+| ---- | ---- |
+| <a href="https://www.ipwo.net/?ref=githubgptautoregister"><img src="https://github.com/Regert888/gpt-auto-register/raw/main/assets/ipwo-banner.png" width="140"></a> | [IPWO 住宅代理](https://www.ipwo.net/?ref=githubgptautoregister) 覆盖 195+ 个国家和地区，支持 HTTP(S) / SOCKS5 协议及灵活的代理配置，为自动化开发与合规网络测试提供多地区网络连接选择。提供动态住宅代理、静态住宅代理、不限量住宅代理等方案，[注册可以领2GB动态代理无门槛免费测试](https://www.ipwo.net/?ref=githubgptautoregister)。90折扣码：`0200` |
+
+
+
+
+
 ## 文件清单
 
 ### 核心库（命令行 + WebUI 共用）
@@ -241,6 +250,9 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 |---|---|---|
 | `PROXY` | - | 出口代理 URL，例 `socks5://user:pass@host:port`（curl_cffi 会自动 socks5→socks5h） |
 | `OTP_TIMEOUT` | `60` | OTP 等待秒数（实际下限 30） |
+| `REGISTER_SET_PASSWORD` | `0` | `1`=注册时设置密码（POST user/register）；`0`=无密码，走 passwordless 注册（邮箱 OTP） |
+| `WARMUP_ATTEMPTS` | `8` | chatgpt.com warmup 种 `oai-did` 的最大尝试次数（403 时 1.2s 快速换出口） |
+| `AUTH_IP_ROTATIONS` | `5` | authorize 被 Cloudflare 挑战时，最多换几个出口重跑整段认证链路 |
 | `WEBUI_ALLOW_LOGIN` | `0` | `1`=邮箱被识为已注册时走 OTP login；`0`=fast-fail 抛错 |
 | `SKIP_OAUTH_TOKEN_EXCHANGE` | `0` | `1`=跳过 OAuth refresh_token 交换 |
 | `OAUTH_CODEX_RT_EXCHANGE` | `1` | `1`=尝试 Codex OAuth 拿 refresh_token |
@@ -258,6 +270,12 @@ python register_outlook.py 'email----password----client_id----refresh_token'
 
 OpenAI 注册有概率被风控跳到 `add-phone` 步骤，**不绑手机号就拿不到 refresh_token**。
 WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动租号 + 等 SMS + 自动验证。
+
+> ⚠️ **Codex RT 实测（2026-11）**：正常新号的 Codex OAuth 授权会稳定落到
+> `session/select → continue_url=/add-phone`，去掉 `prompt` 重授权也一样；
+> 只有极少数“运气号”能直接过。**接码是常规路径，不是可选优化**。
+> 未配置接码时，号仍可注册成功（session / access_token 可用），但拿不到 refresh_token。
+> v0.5.8 曾出现“无需接码”的现象，那是临时 bug，后续版本已修正，不要依赖。
 
 ### 支持的平台
 
@@ -297,17 +315,11 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 - 没装 node 也能跑，但只能用于纯协议探测，**不能真发码**。
 
 ### Outlook 收件细节
-- **Junk 邮件**：OpenAI 首次发码给陌生收件人常被 outlook 反垃圾分到 Junk，本脚本扫多 folder（INBOX / Junk / Junk Email / Spam）。
-- **tm1.openai.com 影子发码**：OpenAI 当前坏掉的发码域，所有账号都返固定 OTP=493682 → verify 401。已硬过滤。
+- **Junk 邮件**：首次发码给陌生收件人常被 outlook 反垃圾分到 Junk，本脚本扫多 folder（INBOX / Junk / Junk Email / Spam）。
+- **tm1.openai.com 影子发码**： 当前坏掉的发码域，所有账号都返固定 OTP=493682 → verify 401。已硬过滤。
 - **refresh_token 自动滚动续期**：Microsoft access_token 1 天有效，本模块每 3000s 自动续期。
 
-### OpenAI 反欺诈
-- **已有账号分支**：邮箱被识为已注册时，默认 fast-fail 抛 `RuntimeError`（防 honeypot）。
-  设 `WEBUI_ALLOW_LOGIN=1` 改走 OTP login 拿凭证。
-- **`authorize/continue` 已 trigger 发码**：passwordless 模式下 OpenAI 已经发了码，
-  此时 **必须只 resend**，不能再调 `email-otp/send`（会新建 challenge → 旧 OTP 失效 → wrong_email_otp_code）。
-  脚本里 `kickoff_otp_delivery` 已根据 `_is_existing_account` 自动切分支。
-- **批量注册次日存活率约 2%**（原项目反欺诈研究数据），单号 / 偶发使用没问题。
+
 
 ### 网络层
 - **curl_cffi SOCKS5**：默认会把 `socks5://` 规范化成 `socks5h://`（DNS 走代理解析），减少 TLS 握手异常。
@@ -315,9 +327,8 @@ WebUI「📱 接码配置」Tab 启用接码后，命中 add-phone 时会自动�
 - **Cloudflare 403**：`get_csrf_token` 内置 3 次重试 + 指数 backoff。
 
 ### SMS 接码
-- **WhatsApp vs SMS**：OpenAI 自 2025 年起对大部分国家改用 WhatsApp 验证。如果租到的国家不在白名单，接码平台收不到 SMS → 超时 → cancel 退款。
 - **HeroSMS 退款机制**：HeroSMS 购买后 2 分钟内不可取消，取消后 20 分钟自动退款到余额；SmsBower 可立即取消退款。注册机中号码不可用时会立刻换号，HeroSMS 的废号等 20 分钟后自动退回。
-- **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码（OpenAI 偶尔拒第一条码但接受第二条）。
+- **OTP validate 失败 → resend 兜底**：phone-otp/validate 401 时会自动 resend 一次再等新码。
 
 ## License
 
